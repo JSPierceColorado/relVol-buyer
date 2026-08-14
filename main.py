@@ -3,17 +3,18 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Iterable
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 
 INTERVAL_SECONDS = 16 * 60
+SYMBOL_COOLDOWN_DAYS = 2
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 logging.basicConfig(
@@ -101,7 +102,7 @@ def get_ranked_symbols(sheets_service) -> list[tuple[str, float]]:
 
     # Highest relative-volume rows first. De-dupe symbols, but keep the full
     # ranked list so we can continue downward whenever higher-ranked symbols
-    # have already been bought.
+    # are already held or still inside their cooldown.
     candidates.sort(key=lambda item: item[1], reverse=True)
 
     ranked: list[tuple[str, float]] = []
@@ -122,6 +123,44 @@ def cancel_open_orders(alpaca: TradingClient) -> None:
 
 def held_symbols(alpaca: TradingClient) -> set[str]:
     return {position.symbol.upper() for position in alpaca.get_all_positions()}
+
+
+def cooldown_symbols(alpaca: TradingClient) -> set[str]:
+    """
+    Return symbols that have had any filled BUY quantity within the last 48 hours.
+
+    Alpaca order history is used instead of in-memory state, so the cooldown
+    survives Railway restarts without a database or local persistence.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SYMBOL_COOLDOWN_DAYS)
+
+    orders = alpaca.get_orders(
+        filter=GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            side=OrderSide.BUY,
+            after=cutoff,
+            limit=500,
+        )
+    )
+
+    symbols: set[str] = set()
+
+    for order in orders:
+        symbol = str(order.symbol or "").strip().upper()
+        if not symbol:
+            continue
+
+        try:
+            filled_qty = Decimal(str(order.filled_qty or "0"))
+        except Exception:
+            continue
+
+        # Rejected/canceled buys with zero fills do not start a cooldown.
+        # Partial fills do: if any shares were actually bought, the symbol rests.
+        if filled_qty > 0:
+            symbols.add(symbol)
+
+    return symbols
 
 
 def order_notional(alpaca: TradingClient) -> Decimal:
@@ -165,10 +204,12 @@ def run_cycle(alpaca: TradingClient, sheets_service) -> None:
     ranked = get_ranked_symbols(sheets_service)
     logger.info("Found %d ranked sheet candidate(s).", len(ranked))
 
-    # 3) Duplicate protection: never submit another buy for a symbol already held.
-    # Keep moving down the ranking until five NEW symbols have been submitted.
-    # Example: if ranks 1-5 are already held, ranks 6-10 become the five buys.
+    # 3) Duplicate + cooldown protection.
+    # Never submit another buy for a symbol already held or bought within the
+    # last 48 hours. Keep moving down the ranking until five eligible NEW
+    # symbols have been submitted.
     already_held = held_symbols(alpaca)
+    on_cooldown = cooldown_symbols(alpaca)
     submitted_this_cycle: set[str] = set()
     buys_submitted = 0
 
@@ -181,6 +222,15 @@ def run_cycle(alpaca: TradingClient, sheets_service) -> None:
                 "Skipping %s (relative volume=%s): position already exists.",
                 symbol,
                 relative_volume,
+            )
+            continue
+
+        if symbol in on_cooldown:
+            logger.info(
+                "Skipping %s (relative volume=%s): inside %d-day cooldown.",
+                symbol,
+                relative_volume,
+                SYMBOL_COOLDOWN_DAYS,
             )
             continue
 
@@ -197,7 +247,6 @@ def run_cycle(alpaca: TradingClient, sheets_service) -> None:
             logger.exception("Order failed for %s; trying the next ranked symbol.", symbol)
 
     logger.info("Submitted %d new buy order(s) this cycle.", buys_submitted)
-
     logger.info("Cycle complete.")
 
 
@@ -206,9 +255,10 @@ def main() -> None:
     sheets_service = make_sheets_service()
 
     logger.info(
-        "Bot started | Alpaca mode=%s | interval=%d seconds",
+        "Bot started | Alpaca mode=%s | interval=%d seconds | symbol cooldown=%d days",
         "PAPER" if env_bool("ALPACA_PAPER", True) else "LIVE",
         INTERVAL_SECONDS,
+        SYMBOL_COOLDOWN_DAYS,
     )
 
     next_run = time.monotonic()
